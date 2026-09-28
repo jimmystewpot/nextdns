@@ -366,6 +366,9 @@ func run(args []string) error {
 		Timeout:             c.Timeout,
 		MaxInflightRequests: c.MaxInflightRequests,
 	}
+	if err := applyDoTConfig(&c, &p.Proxy, log); err != nil {
+		return err
+	}
 
 	discoverHosts := &discovery.Hosts{OnError: func(err error) { log.Errorf("hosts: %v", err) }}
 	if c.UseHosts {
@@ -550,6 +553,47 @@ func isLocalhostMode(c *config.Config) bool {
 			}
 		}
 	}
+	return true
+}
+
+// applyDoTConfig configures DNS-over-TLS on p using settings from c.
+// If c.ListensTLS is empty, it is a no-op.
+// If neither -tls-cert nor -tls-key was specified, it probes canonical defaults
+// (/etc/nextdns/fullchain.pem, /etc/nextdns/privkey.pem). If defaults are absent,
+// it logs a warning via host.Logger and returns nil so plaintext DNS53 can serve ACME clients.
+// If cert paths were explicitly specified (or defaults exist), any error loading is hard.
+func applyDoTConfig(c *config.Config, p *proxy.Proxy, log host.Logger) error {
+	if len(c.ListensTLS) == 0 {
+		return nil
+	}
+	certFile, keyFile := c.TLSCert, c.TLSKey
+	if certFile == "" && keyFile == "" {
+		const defaultCert = "/etc/nextdns/fullchain.pem"
+		const defaultKey = "/etc/nextdns/privkey.pem"
+		if !canReadFile(defaultCert) || !canReadFile(defaultKey) {
+			log.Warningf("no TLS certificate files found at %s and %s; DoT listener on %v disabled until certificates are provisioned. See -tls-cert and -tls-key flags.",
+				defaultCert, defaultKey, c.ListensTLS)
+			return nil
+		}
+		certFile, keyFile = defaultCert, defaultKey
+	}
+	tlsConfig, err := proxy.NewServerTLSConfig(certFile, keyFile)
+	if err != nil {
+		return fmt.Errorf("DoT: %w", err)
+	}
+	p.TLSAddrs = c.ListensTLS
+	p.TLSConfig = tlsConfig
+	p.MaxTLSConnections = c.MaxTLSConnections
+	p.TLSIdleTimeout = c.TLSIdleTimeout
+	return nil
+}
+
+func canReadFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
 	return true
 }
 
