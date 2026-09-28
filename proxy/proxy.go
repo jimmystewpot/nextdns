@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -75,6 +76,18 @@ type Proxy struct {
 	// ErrorLog specifies an optional log function for errors. If not set,
 	// errors are not reported.
 	ErrorLog func(error)
+
+	// TLSAddrs specifies the TLS addresses to listen to for DNS-over-TLS (DoT).
+	TLSAddrs []string
+
+	// TLSConfig specifies the TLS configuration for DoT listeners.
+	TLSConfig *tls.Config
+
+	// MaxTLSConnections defines the maximum number of concurrent TLS connections.
+	MaxTLSConnections uint
+
+	// TLSIdleTimeout defines the idle timeout for TLS connections.
+	TLSIdleTimeout time.Duration
 }
 
 const defaultMaxInflightRequests = 256
@@ -111,11 +124,16 @@ func (p Proxy) ListenAndServe(ctx context.Context) error {
 	lc := &net.ListenConfig{}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	expReturns := (len(addrs) * 2) + 1
+	tlsListeners := 0
+	if p.TLSConfig != nil {
+		tlsListeners = len(p.TLSAddrs)
+	}
+	expReturns := (len(addrs) * 2) + tlsListeners + 1
 	errs := make(chan error, expReturns)
 	var closeAll []func() error
 	var closeAllMu sync.Mutex
 	inflightRequests := make(chan struct{}, p.maxInflightRequests())
+	tlsConnections := make(chan struct{}, p.maxTLSConnections())
 
 	for _, addr := range addrs {
 		go func(addr string) {
@@ -153,16 +171,40 @@ func (p Proxy) ListenAndServe(ctx context.Context) error {
 		}(addr)
 	}
 
+	if p.TLSConfig != nil {
+		for _, addr := range p.TLSAddrs {
+			go func(addr string) {
+				var err error
+				p.logInfof("Listening on DoT/%s", addr)
+				tcp, err := lc.Listen(ctx, "tcp", addr)
+				if err == nil {
+					closeAllMu.Lock()
+					closeAll = append(closeAll, tcp.Close)
+					closeAllMu.Unlock()
+					tlsL := tls.NewListener(tcp, p.TLSConfig)
+					err = p.serveTLS(ctx, tlsL, inflightRequests, tlsConnections)
+				}
+				cancel()
+				if err != nil {
+					err = fmt.Errorf("dot: %w", err)
+				}
+				errs <- err
+			}(addr)
+		}
+	}
+
 	<-ctx.Done()
 	errs <- ctx.Err()
+	closeAllMu.Lock()
 	for _, close := range closeAll {
 		_ = close()
 	}
+	closeAllMu.Unlock()
 	// Wait for the two sockets (+ ctx err) to be terminated and return the
 	// initial error.
 	var err error
 	for range expReturns {
-		if e := <-errs; (err == nil || errors.Is(err, context.Canceled)) && e != nil {
+		if e := <-errs; (err == nil || errors.Is(err, context.Canceled)) && e != nil && !errors.Is(e, net.ErrClosed) {
 			err = e
 		}
 	}
@@ -204,6 +246,20 @@ func (p Proxy) maxInflightRequests() int {
 		return defaultMaxInflightRequests
 	}
 	return int(p.MaxInflightRequests)
+}
+
+func (p Proxy) maxTLSConnections() int {
+	if p.MaxTLSConnections == 0 {
+		return 10
+	}
+	return int(p.MaxTLSConnections)
+}
+
+func (p Proxy) tlsIdleTimeout() time.Duration {
+	if p.TLSIdleTimeout == 0 {
+		return 60 * time.Second
+	}
+	return p.TLSIdleTimeout
 }
 
 func tryAcquireRequest(inflightRequests chan struct{}) bool {
