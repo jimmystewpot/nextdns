@@ -37,6 +37,11 @@ type Config struct {
 	SetupRouter                 bool
 	AutoActivate                bool
 	Debug                       bool
+	ListensTLS                  []string
+	TLSCert                     string
+	TLSKey                      string
+	MaxTLSConnections           uint
+	TLSIdleTimeout              time.Duration
 }
 
 // Validate checks constraints between configuration values.
@@ -54,6 +59,13 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxInflightUpstreamRequests > maxUpstreamLimit {
 		return fmt.Errorf("max-inflight-upstream-requests must not exceed %d when max-inflight-requests is %d", maxUpstreamLimit, proxyLimit)
+	}
+	if len(c.ListensTLS) > 0 {
+		certSet := c.TLSCert != ""
+		keySet := c.TLSKey != ""
+		if certSet != keySet {
+			return fmt.Errorf("both -tls-cert and -tls-key must be specified together")
+		}
 	}
 	return nil
 }
@@ -111,6 +123,38 @@ func (c *Config) flagSet(cmd string) flagSet {
 	}
 	fs.BoolVar(&c.Debug, "debug", false, "Enable debug logs.")
 	fs.StringsVar(&c.Listens, "listen", "Listen address for UDP DNS proxy server.")
+	fs.StringsVar(&c.ListensTLS, "listen-tls",
+		"Listen on address for DNS-over-TLS (DoT). Example: -listen-tls :853\n"+
+			"Requires -tls-cert and -tls-key to point to a CA-signed certificate chain\n"+
+			"and private key (e.g. from Let's Encrypt). Self-signed certificates are not\n"+
+			"supported for Android Private DNS Automatic mode, which enforces SSL_VERIFY_PEER.")
+	fs.StringVar(&c.TLSCert, "tls-cert", "",
+		"Path to the TLS certificate (PEM) for DNS-over-TLS.\n"+
+			"Example: /etc/letsencrypt/live/router.example.com/fullchain.pem\n"+
+			"Must be specified together with -tls-key.")
+	fs.StringVar(&c.TLSKey, "tls-key", "",
+		"Path to the TLS private key (PEM) for DNS-over-TLS.\n"+
+			"Example: /etc/letsencrypt/live/router.example.com/privkey.pem\n"+
+			"Must be specified together with -tls-cert.")
+	fs.UintVar(&c.MaxTLSConnections, "max-tls-connections", 10,
+		"Maximum number of concurrent DNS-over-TLS connections.\n"+
+			"\n"+
+			"Default is 10. This low default is intentional: each TLS connection in Go\n"+
+			"maintains ~40KB of crypto/tls I/O buffers. At the default of 10 connections,\n"+
+			"peak DoT buffer memory is ~400KB — safe for router firmware with 32MB–64MB\n"+
+			"of RAM. Increase this value on hardware with ample memory.\n"+
+			"\n"+
+			"Note: each open TLS connection may pipeline multiple concurrent DNS queries,\n"+
+			"which compete with UDP/TCP queries for the global max-inflight-requests\n"+
+			"semaphore. A reasonable ceiling is max-inflight-requests / max-tls-connections\n"+
+			"pipelined queries per connection before UDP clients begin receiving SERVFAIL.")
+	fs.DurationVar(&c.TLSIdleTimeout, "tls-idle-timeout", 60*time.Second,
+		"Maximum idle duration before closing an inactive DNS-over-TLS connection.\n"+
+			"\n"+
+			"Default is 60s, longer than the plaintext TCP read timeout (10s), to respect\n"+
+			"RFC 7766 keep-alive recommendations. Mobile clients (Android) pool DoT\n"+
+			"connections to avoid repeated TLS handshakes; aggressively closing idle\n"+
+			"connections increases latency and battery drain.")
 	fs.StringVar(&c.Control, "control", DefaultControl, "Address to the control socket.")
 	fs.Var(&c.ConfigDeprecated, "config", "deprecated, use -profile instead")
 	fs.Var(&c.Profile, "profile",
